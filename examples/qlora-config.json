@@ -1,0 +1,1 @@
+{"batch":2,"flash_attn":true,"gpu":"rtx4090","grad_checkpoint":true,"model":"qwen2.5-7b","optimizer":"adamw-8bit","quant_bits":4,"rank":32,"seq_len":4096,"target_modules":"attention","train_dtype":"bf16"}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qlora-calc"
+version = "1.0.0"
+description = "QLoRA VRAM estimator: will this fine-tune fit on your GPU?"
+authors = [{name = "Yashwanth Nomula"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+qcalc = "qloracalc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qloracalc*"]

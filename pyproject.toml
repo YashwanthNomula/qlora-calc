@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qlora-calc"
-version = "1.0.0"
+version = "1.1.0"
 description = "QLoRA VRAM estimator: will this fine-tune fit on your GPU?"
 authors = [{name = "Yashwanth Nomula"}]
 license = {text = "MIT"}

@@ -11,7 +11,16 @@ from dataclasses import replace
 from qloracalc import __version__
 from qloracalc import estimator as E
 from qloracalc import report as R
-from qloracalc.models import GPU_SIZES, PRESETS, ModelSpec, parse_gpu, parse_size
+from qloracalc import throughput as T
+from qloracalc.models import (
+    GPU_SIZES,
+    GPU_TFLOPS,
+    PRESETS,
+    ModelSpec,
+    parse_gpu,
+    parse_size,
+    parse_tflops,
+)
 
 
 def _model_from_args(args) -> ModelSpec:
@@ -77,6 +86,11 @@ def _apply_config_file(args, data: dict):
         "quant_bits": "bits", "rank": "rank",
         "target_modules": "targets", "seq_len": "seq_len", "batch": "batch",
         "optimizer": "optimizer", "train_dtype": "dtype", "gpu": "gpu",
+        "gpus": "gpus",
+        "tflops": "tflops", "mfu": "mfu",
+        "dataset_tokens": "dataset_tokens", "examples": "examples",
+        "avg_len": "avg_len", "epochs": "epochs",
+        "scaling_eff": "scaling_eff",
     }
     for key, attr in mapping.items():
         if key in data and getattr(args, attr, None) is None:
@@ -151,12 +165,29 @@ def _prepare(args):
 
 def cmd_estimate(args):
     cfg, gpu_gb, gpu_label = _prepare(args)
+    gpus = 1 if args.gpus is None else args.gpus
+    if gpus < 1:
+        raise ValueError("--gpus must be >= 1")
+    if gpus > 1:
+        return _cmd_estimate_multi(args, cfg, gpu_gb, gpu_label, gpus)
     est = E.estimate(cfg)
     if args.format == "json":
         print(R.render_estimate_json(est, gpu_gb, gpu_label))
     else:
         print(R.render_estimate(est, gpu_gb, gpu_label))
     if args.strict and not E.fits(est, gpu_gb):
+        return 1
+    return 0
+
+
+def _cmd_estimate_multi(args, cfg, gpu_gb, gpu_label, gpus):
+    shards = E.shard_plan(cfg, gpus)
+    rec = E.recommend_strategy(shards, gpu_gb)
+    if args.format == "json":
+        print(R.render_shard_plan_json(shards, cfg, gpu_gb, gpu_label, rec))
+    else:
+        print(R.render_shard_plan(shards, cfg, gpu_gb, gpu_label, rec))
+    if args.strict and rec[0] is None:
         return 1
     return 0
 
@@ -197,6 +228,46 @@ def cmd_compare(args):
     return 0
 
 
+def _resolve_tflops(args) -> tuple[float, str]:
+    """--tflops wins; else look up --gpu in the TFLOPS table."""
+    if args.tflops is not None:
+        return parse_tflops(str(args.tflops))
+    gpu_key = (args.gpu or "").strip().lower()
+    if gpu_key in GPU_TFLOPS:
+        return GPU_TFLOPS[gpu_key], gpu_key
+    raise ValueError(
+        "throughput needs a GPU throughput figure: pass --tflops N "
+        "(e.g. --tflops 165) or --gpu <name> with a known card "
+        f"({', '.join(sorted(GPU_TFLOPS))})"
+    )
+
+
+def cmd_throughput(args):
+    cfg, _gpu_gb, _gpu_label = _prepare(args)
+    tflops, tflops_label = _resolve_tflops(args)
+    if args.dataset_tokens is not None and (
+            args.examples is not None or args.avg_len is not None):
+        raise ValueError(
+            "pass --dataset-tokens OR --examples + --avg-len, not both")
+    if (args.examples is None) != (args.avg_len is None):
+        raise ValueError("--examples and --avg-len must be given together")
+    dataset_tokens = args.dataset_tokens
+    if dataset_tokens is None and args.examples is not None:
+        if args.examples < 0 or args.avg_len < 0:
+            raise ValueError("--examples and --avg-len must be >= 0")
+        dataset_tokens = float(args.examples) * float(args.avg_len)
+    est = T.estimate_throughput(
+        cfg, tflops, mfu=args.mfu, gpus=args.gpus,
+        scaling_eff=args.scaling_eff,
+        dataset_tokens=dataset_tokens, epochs=args.epochs)
+    est.gpu_label = tflops_label
+    if args.format == "json":
+        print(R.render_throughput_json(est))
+    else:
+        print(R.render_throughput(est))
+    return 0
+
+
 def cmd_models(_args):
     print("preset models:")
     print(R.render_models(PRESETS.values()))
@@ -221,6 +292,14 @@ def cmd_demo(_args):
     print("demo 3: what is the biggest batch for the 8B run on 24GB?")
     print()
     print(f"  max micro-batch: {E.max_batch(cfg, 24.0)}")
+    print()
+    print("demo 4: how long does one epoch over 10M tokens take on an RTX 4090?")
+    print()
+    import qloracalc.throughput as T
+    test = T.estimate_throughput(cfg, 165.0, mfu=0.40,
+                                 dataset_tokens=10_000_000, epochs=1)
+    test.gpu_label = "rtx4090"
+    print(R.render_throughput(test))
     return 0
 
 
@@ -237,6 +316,9 @@ def build_parser():
     _add_train_args(pe)
     pe.add_argument("--strict", action="store_true",
                     help="exit 1 when the config exceeds the GPU budget")
+    pe.add_argument("--gpus", type=int, default=None,
+                    help="plan sharding across N GPUs: compares data-parallel "
+                         "vs tensor-parallel per-GPU VRAM (default: 1)")
     pe.set_defaults(func=cmd_estimate)
 
     pf = sub.add_parser("fit", help="find the largest micro-batch that fits")
@@ -247,6 +329,27 @@ def build_parser():
                         help="compare 4/8/16-bit quantization for one config")
     _add_train_args(pc)
     pc.set_defaults(func=cmd_compare)
+
+    pt = sub.add_parser("throughput",
+                        help="estimate training speed and wall-clock time")
+    _add_train_args(pt)
+    pt.add_argument("--tflops", default=None,
+                    help="GPU peak BF16/FP16 tensor TFLOPS: a number like 165, "
+                         "or a known card name; overrides --gpu lookup")
+    pt.add_argument("--mfu", type=float, default=0.40,
+                    help="model FLOPs utilization 0-1 (default: 0.40)")
+    pt.add_argument("--dataset-tokens", type=float, default=None,
+                    help="training tokens per epoch (for wall-clock)")
+    pt.add_argument("--examples", type=float, default=None,
+                    help="dataset size in examples (needs --avg-len)")
+    pt.add_argument("--avg-len", type=float, default=None,
+                    help="average tokens per example (needs --examples)")
+    pt.add_argument("--epochs", type=int, default=1)
+    pt.add_argument("--gpus", type=int, default=1,
+                    help="number of GPUs (default: 1)")
+    pt.add_argument("--scaling-eff", type=float, default=0.90,
+                    help="per-GPU efficiency when gpus > 1 (default: 0.90)")
+    pt.set_defaults(func=cmd_throughput)
 
     pm = sub.add_parser("models", help="list preset models and known GPUs")
     pm.set_defaults(func=cmd_models)

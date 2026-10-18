@@ -88,6 +88,16 @@ qcalc estimate --config examples/qlora-config.json
 
 # custom architecture instead of a preset
 qcalc estimate --params-b 13 --layers 40 --hidden 5120 --ffn 13824 --gpu 40
+
+# plan across N GPUs: data-parallel vs tensor-parallel per-GPU VRAM
+qcalc estimate --model llama-3-70b --batch 1 --gpus 2 --gpu rtx4090
+
+# training speed + wall-clock: 10M tokens/epoch, 3 epochs, RTX 4090
+qcalc throughput --model llama-3-8b --gpu rtx4090 --dataset-tokens 10000000 --epochs 3
+# same, from dataset size: 5,000 examples x ~2,000 tokens each, 2 GPUs
+qcalc throughput --model llama-3-8b --tflops 165 --examples 5000 --avg-len 2000 --gpus 2
+# rates only (no wall-clock) with an explicit MFU
+qcalc throughput --model llama-3-8b --tflops 312 --mfu 0.5
 ```
 
 ## How the math works
@@ -102,6 +112,52 @@ qcalc estimate --params-b 13 --layers 40 --hidden 5120 --ffn 13824 --gpu 40
 | Logits | b x s x vocab in the train dtype (the cross-entropy input; large for 128k vocabs) |
 | CUDA overhead | ~1 GB context + 5% fragmentation reserve |
 
+## Multi-GPU sharding
+
+`qcalc estimate --gpus N` plans the same config across N identical GPUs and
+compares two sharding strategies, with a per-GPU verdict for each:
+
+| Strategy | Per-GPU VRAM |
+|---|---|
+| data-parallel | base weights, adapters and gradients replicated; optimizer states and micro-batch sharded /N (ZeRO-1 style) |
+| tensor-parallel | weights, adapters, gradients, optimizer states, activations and logits all sharded /N, plus a ~2% NCCL/collective buffer |
+
+qcalc recommends the strategy that fits with the most per-GPU headroom.
+With `--format json` the full per-strategy plan (components, fits,
+headroom) is machine-readable; with `--strict`, exit 1 means neither
+strategy fits the cards.
+
+## Training throughput
+
+`qcalc throughput` answers the second planning question: how long will
+the run take? It uses the standard 6N FLOPs/token accounting (forward 2N
++ backward 4N), rising to 8N with gradient checkpointing (the forward
+pass is recomputed), scaled by model FLOPs utilization (MFU, default
+0.40) against the GPU's peak BF16/FP16 tensor-core throughput.
+
+```bash
+$ qcalc throughput --model llama-3-8b --gpu rtx4090 --dataset-tokens 10000000 --epochs 3
+training throughput: llama-3-8b (8.03B params)
+  config: 4-bit, rank 16 (attention), seq 2048, batch 2, grad-ckpt on, flash-attn on, adamw-8bit, bf16
+  GPU: rtx4090 @ 165 peak TFLOPS (BF16/FP16 tensor), MFU 0.40 -> 66.0 effective TFLOPS
+  compute: 8 FLOPs/token (with grad checkpointing)
+
+  tokens/sec:     1,027
+  steps/sec:      0.2508 (step = batch 2 x seq 2048 = 4,096 tokens)
+  sec/step:       3.99
+
+  dataset:        10,000,000 tokens/epoch x 3 epoch(s)
+  total steps:    7,324
+  wall-clock:     8h 06m (8.11 h)
+```
+
+`--tflops` takes an explicit peak figure (or a known card name) and
+overrides the `--gpu` lookup; `--mfu` tunes the utilization assumption;
+`--gpus N` scales near-linearly with a `--scaling-eff` discount (default
+0.90) for communication. Treat the wall-clock as a planning estimate
+with a +/-2x band: data loading, eval, checkpointing and optimizer
+overhead are not modelled.
+
 ## Caveats
 
 This is an **estimate**, not a measurement. Real runs vary with the
@@ -113,7 +169,7 @@ overstates dense-equivalent training memory.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q   # 35 tests
+python -m pytest tests/ -q   # 68 tests
 ```
 
 ## License

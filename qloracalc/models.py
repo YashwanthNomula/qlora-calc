@@ -57,6 +57,41 @@ GPU_SIZES: dict[str, float] = {
 }
 
 
+# Approximate peak dense BF16/FP16 tensor-core TFLOPS per GPU (vendor
+# specs, sparsity off). Used by the throughput estimator; pass --tflops
+# to override with a measured or quoted figure for your exact card.
+GPU_TFLOPS: dict[str, float] = {
+    "rtx4060ti": 44.0,
+    "rtx3090": 71.0,
+    "rtx4090": 165.0,
+    "a10": 125.0,
+    "l4": 121.0,
+    "a100-40": 312.0,
+    "a100": 312.0,
+    "a6000": 155.0,
+    "l40s": 362.0,
+    "a100-80": 312.0,
+    "h100": 989.0,
+    "h200": 989.0,
+    "b200": 2250.0,
+}
+
+
+def parse_tflops(text: str) -> tuple[float, str]:
+    """Parse '165', '165tflops', or a known GPU name into (TFLOPS, label)."""
+    t = text.strip().lower().replace(" ", "")
+    if t in GPU_TFLOPS:
+        return GPU_TFLOPS[t], t
+    t = t.removesuffix("tflops").removesuffix("tf")
+    try:
+        return float(t), f"{float(t):g} TFLOPS"
+    except ValueError:
+        raise ValueError(
+            f"unknown GPU/TFLOPS '{text}': use a number like 165 or a name like "
+            + ", ".join(sorted(GPU_TFLOPS))
+        )
+
+
 def parse_size(text: str) -> float:
     """Parse '7b', '8.03B', '800m' into billions of parameters."""
     t = text.strip().lower().replace("_", "")

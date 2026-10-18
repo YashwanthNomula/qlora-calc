@@ -219,3 +219,108 @@ def describe_config(cfg: TrainConfig) -> str:
         f"seq {cfg.seq_len}, batch {cfg.batch}, grad-ckpt {ckpt}, "
         f"flash-attn {flash}, {cfg.optimizer}, {cfg.train_dtype}"
     )
+
+
+# ---- multi-GPU sharding -----------------------------------------------------
+
+# Extra per-GPU NCCL/collective buffer for tensor-parallel training,
+# as a fraction of the sharded subtotal.
+TP_OVERHEAD_FRAC = 0.02
+
+
+@dataclass
+class StrategyPlan:
+    """Per-GPU VRAM plan for one multi-GPU sharding strategy."""
+    strategy: str        # "data-parallel" or "tensor-parallel"
+    gpus: int
+    per_gpu_batch: float
+    components: list[tuple[str, float]] = field(default_factory=list)  # per GPU
+    total_bytes: float = 0.0
+
+    @property
+    def per_gpu_gb(self) -> float:
+        return self.total_bytes / GIB
+
+    def fits(self, gpu_gb: float) -> bool:
+        return self.per_gpu_gb <= gpu_gb
+
+    def headroom(self, gpu_gb: float) -> float:
+        return gpu_gb - self.per_gpu_gb
+
+
+def _cuda_overhead(subtotal: float) -> float:
+    return 1.0 * GIB + 0.05 * subtotal
+
+
+def shard_plan(cfg: TrainConfig, n_gpus: int) -> dict[str, StrategyPlan]:
+    """Split a training config's VRAM across n_gpus, for two strategies.
+
+    data-parallel: every GPU replicates the frozen base weights, the LoRA
+    adapters and their gradients (standard DDP); the micro-batch and the
+    optimizer states are sharded across ranks (ZeRO-1 style).
+
+    tensor-parallel: weights, adapters, gradients, optimizer states,
+    activations and logits are all sharded ~1/n per GPU, plus a small
+    NCCL/collective buffer per GPU.
+
+    Activations and logits scale linearly with the batch, so the per-GPU
+    values come from the single-GPU estimate divided by the shard factor.
+    """
+    if n_gpus < 2:
+        raise ValueError("n_gpus must be >= 2 for a sharding plan")
+    est = estimate(cfg)
+    # component order: weights, adapters, grads, optimizer, activations,
+    # logits, CUDA overhead
+    weights, adapters, grads, optimizer, activations, logits, _ = \
+        [nbytes for _, nbytes in est.components]
+    gpu_batch = cfg.batch / n_gpus
+
+    # data-parallel: replicate the model, shard batch + optimizer states
+    dp_parts = [
+        ("base weights (replicated)", weights),
+        ("LoRA adapters (replicated)", adapters),
+        ("gradients (replicated)", grads),
+        (f"optimizer states (sharded /{n_gpus})", optimizer / n_gpus),
+        (f"activations (batch {gpu_batch:g}/GPU)", activations / n_gpus),
+        ("output logits (sharded)", logits / n_gpus),
+    ]
+    dp_sub = sum(nbytes for _, nbytes in dp_parts)
+    dp_ovh = _cuda_overhead(dp_sub)
+    dp_parts.append(("CUDA overhead", dp_ovh))
+
+    # tensor-parallel: shard everything, add a small comm buffer
+    tp_parts = [
+        ("base weights (sharded)", weights / n_gpus),
+        ("LoRA adapters (sharded)", adapters / n_gpus),
+        ("gradients (sharded)", grads / n_gpus),
+        ("optimizer states (sharded)", optimizer / n_gpus),
+        ("activations (sharded)", activations / n_gpus),
+        ("output logits (sharded)", logits / n_gpus),
+    ]
+    tp_sub = sum(nbytes for _, nbytes in tp_parts)
+    tp_ovh = _cuda_overhead(tp_sub)
+    tp_comm = TP_OVERHEAD_FRAC * tp_sub
+    tp_parts.append(("CUDA overhead", tp_ovh))
+    tp_parts.append(("tensor-parallel overhead", tp_comm))
+
+    return {
+        "data-parallel": StrategyPlan(
+            strategy="data-parallel", gpus=n_gpus, per_gpu_batch=gpu_batch,
+            components=dp_parts, total_bytes=dp_sub + dp_ovh),
+        "tensor-parallel": StrategyPlan(
+            strategy="tensor-parallel", gpus=n_gpus, per_gpu_batch=gpu_batch,
+            components=tp_parts, total_bytes=tp_sub + tp_ovh + tp_comm),
+    }
+
+
+def recommend_strategy(shards: dict[str, StrategyPlan],
+                       gpu_gb: float) -> tuple[str | None, str]:
+    """Pick the strategy with the most per-GPU headroom among those that fit."""
+    fitting = [(name, plan) for name, plan in shards.items()
+               if plan.fits(gpu_gb)]
+    if not fitting:
+        return None, ("neither strategy fits: add GPUs, shrink the model "
+                      "or batch, or drop to 4-bit")
+    name, plan = max(fitting, key=lambda item: item[1].headroom(gpu_gb))
+    return name, (f"{name} fits with "
+                 f"{plan.headroom(gpu_gb):.1f} GB headroom per GPU")

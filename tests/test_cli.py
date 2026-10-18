@@ -115,3 +115,57 @@ def test_bad_config_file_errors(tmp_path):
     with pytest.raises(SystemExit) as exc:
         run(["estimate", "--config", str(p)])
     assert exc.value.code == 2
+
+
+def test_estimate_gpus1_matches_default(capsys):
+    assert run(["estimate", "--model", "llama-3-8b", "--gpu", "24",
+                "--gpus", "1"]) == 0
+    out1 = capsys.readouterr().out
+    assert run(["estimate", "--model", "llama-3-8b", "--gpu", "24"]) == 0
+    out2 = capsys.readouterr().out
+    assert out1 == out2
+
+
+def test_estimate_gpus2_text(capsys):
+    rc = run(["estimate", "--model", "llama-3-70b", "--batch", "1",
+              "--gpu", "rtx4090", "--gpus", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "data-parallel" in out
+    assert "tensor-parallel" in out
+    assert "recommendation" in out
+
+
+def test_estimate_gpus2_json(capsys):
+    rc = run(["estimate", "--model", "llama-3-8b", "--gpu", "24",
+              "--gpus", "2", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["gpus"] == 2
+    assert set(payload["strategies"]) == {"data-parallel", "tensor-parallel"}
+    dp = payload["strategies"]["data-parallel"]
+    assert dp["per_gpu_batch"] == pytest.approx(1.0)
+    assert dp["fits"] is True
+    assert "base weights (replicated)" in dp["per_gpu_components_gb"]
+    assert payload["recommendation"] in ("data-parallel", "tensor-parallel")
+
+
+def test_estimate_gpus_json_neither_fits(capsys):
+    rc = run(["estimate", "--model", "llama-3-70b", "--batch", "1",
+              "--gpu", "rtx4090", "--gpus", "2", "--format", "json",
+              "--strict"])
+    assert rc == 0  # tensor-parallel fits, so strict passes
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recommendation"] == "tensor-parallel"
+
+
+def test_estimate_gpus_strict_fails_when_neither_fits(capsys):
+    rc = run(["estimate", "--model", "llama-3-70b", "--batch", "1",
+              "--gpu", "8", "--gpus", "2", "--strict"])
+    assert rc == 1
+    assert "neither strategy fits" in capsys.readouterr().out
+
+
+def test_estimate_gpus_zero_errors(capsys):
+    assert run(["estimate", "--model", "llama-3-8b", "--gpus", "0"]) == 2
+    assert "--gpus must be >= 1" in capsys.readouterr().err

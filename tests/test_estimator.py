@@ -176,3 +176,89 @@ def test_describe_config_mentions_key_settings():
     for token in ("4-bit", "rank 16", "attention", "2048", "batch 2",
                   "adamw-8bit", "bf16"):
         assert token in desc
+
+
+# ---- multi-GPU sharding ------------------------------------------------------
+
+def dp70b(**kw):
+    cfg = dict(model=PRESETS["llama-3-70b"], quant_bits=4, rank=16,
+               seq_len=2048, batch=1)
+    cfg.update(kw)
+    return E.TrainConfig(**cfg)
+
+
+def test_shard_plan_requires_two_gpus():
+    with pytest.raises(ValueError):
+        E.shard_plan(llama8b(), 1)
+
+
+def test_shard_plan_strategies():
+    shards = E.shard_plan(llama8b(), 2)
+    assert set(shards) == {"data-parallel", "tensor-parallel"}
+    assert shards["data-parallel"].gpus == 2
+    assert shards["tensor-parallel"].per_gpu_batch == pytest.approx(1.0)
+
+
+def test_data_parallel_replicates_weights_shards_optimizer():
+    est = E.estimate(llama8b())
+    dp = E.shard_plan(llama8b(), 2)["data-parallel"]
+    comp = dict(dp.components)
+    assert comp["base weights (replicated)"] == pytest.approx(
+        est.gb("base weights (4-bit)") * E.GIB)
+    assert comp["optimizer states (sharded /2)"] == pytest.approx(
+        est.gb("optimizer states (adamw-8bit)") * E.GIB / 2)
+
+
+def test_data_parallel_splits_batch_across_gpus():
+    # global batch 4 on 2 GPUs: per-GPU activations match batch 2 single-GPU
+    dp = E.shard_plan(llama8b(batch=4), 2)["data-parallel"]
+    single = E.estimate(llama8b(batch=2))
+    comp = dict(dp.components)
+    assert dp.per_gpu_batch == pytest.approx(2.0)
+    assert comp["activations (batch 2/GPU)"] == pytest.approx(
+        single.gb("activations (grad ckpt)") * E.GIB)
+
+
+def test_tensor_parallel_divides_weights():
+    est = E.estimate(llama8b())
+    tp = E.shard_plan(llama8b(), 4)["tensor-parallel"]
+    comp = dict(tp.components)
+    assert comp["base weights (sharded)"] == pytest.approx(
+        est.gb("base weights (4-bit)") * E.GIB / 4)
+    # small NCCL/comm buffer is present and positive
+    assert comp["tensor-parallel overhead"] > 0
+
+
+def test_shard_components_sum_to_total():
+    for plan in E.shard_plan(llama8b(), 2).values():
+        parts = sum(nbytes for _, nbytes in plan.components)
+        assert parts == pytest.approx(plan.total_bytes, rel=1e-9)
+
+
+def test_70b_dp_exceeds_but_tp_fits_two_24gb():
+    shards = E.shard_plan(dp70b(), 2)
+    assert not shards["data-parallel"].fits(24.0)
+    assert shards["tensor-parallel"].fits(24.0)
+    assert shards["tensor-parallel"].headroom(24.0) > 0
+
+
+def test_shard_verdict_boundary():
+    # 8B recipe on 2 GPUs, 8 GB cards: both strategies fit,
+    # on 4 GB cards neither fits
+    shards = E.shard_plan(llama8b(), 2)
+    assert all(p.fits(8.0) for p in shards.values())
+    assert not any(p.fits(4.0) for p in shards.values())
+
+
+def test_recommend_picks_more_headroom():
+    shards = E.shard_plan(llama8b(), 2)
+    name, reason = E.recommend_strategy(shards, 24.0)
+    assert name == "tensor-parallel"
+    assert "tensor-parallel" in reason
+
+
+def test_recommend_none_when_neither_fits():
+    shards = E.shard_plan(dp70b(), 2)
+    name, reason = E.recommend_strategy(shards, 16.0)
+    assert name is None
+    assert "neither strategy fits" in reason

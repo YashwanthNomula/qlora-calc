@@ -12,6 +12,7 @@ from qloracalc import __version__
 from qloracalc import estimator as E
 from qloracalc import report as R
 from qloracalc import throughput as T
+from qloracalc import cost as C
 from qloracalc.models import (
     GPU_SIZES,
     GPU_TFLOPS,
@@ -242,20 +243,33 @@ def _resolve_tflops(args) -> tuple[float, str]:
     )
 
 
-def cmd_throughput(args):
-    cfg, _gpu_gb, _gpu_label = _prepare(args)
-    tflops, tflops_label = _resolve_tflops(args)
+def _dataset_tokens_per_epoch(args) -> float | None:
+    """Validate the dataset-size flags; return tokens/epoch or None.
+
+    Accepts --dataset-tokens OR (--examples + --avg-len), never both,
+    and never just one of --examples/--avg-len.
+    """
     if args.dataset_tokens is not None and (
             args.examples is not None or args.avg_len is not None):
         raise ValueError(
             "pass --dataset-tokens OR --examples + --avg-len, not both")
     if (args.examples is None) != (args.avg_len is None):
         raise ValueError("--examples and --avg-len must be given together")
-    dataset_tokens = args.dataset_tokens
-    if dataset_tokens is None and args.examples is not None:
+    if args.dataset_tokens is not None:
+        if args.dataset_tokens < 0:
+            raise ValueError("--dataset-tokens must be >= 0")
+        return args.dataset_tokens
+    if args.examples is not None:
         if args.examples < 0 or args.avg_len < 0:
             raise ValueError("--examples and --avg-len must be >= 0")
-        dataset_tokens = float(args.examples) * float(args.avg_len)
+        return float(args.examples) * float(args.avg_len)
+    return None
+
+
+def cmd_throughput(args):
+    cfg, _gpu_gb, _gpu_label = _prepare(args)
+    tflops, tflops_label = _resolve_tflops(args)
+    dataset_tokens = _dataset_tokens_per_epoch(args)
     est = T.estimate_throughput(
         cfg, tflops, mfu=args.mfu, gpus=args.gpus,
         scaling_eff=args.scaling_eff,
@@ -265,6 +279,47 @@ def cmd_throughput(args):
         print(R.render_throughput_json(est))
     else:
         print(R.render_throughput(est))
+    return 0
+
+
+def cmd_cost(args):
+    cfg, _gpu_gb, _gpu_label = _prepare(args)
+    gpus = args.gpus if args.gpus is not None else 1
+    if gpus < 1:
+        raise ValueError("--gpus must be >= 1")
+
+    dataset_tokens = _dataset_tokens_per_epoch(args)
+    total_tokens = (dataset_tokens * args.epochs
+                    if dataset_tokens is not None else None)
+
+    if args.wall_clock is not None:
+        hours = C.parse_wall_clock(args.wall_clock)
+        source = f"your --wall-clock override ({args.wall_clock.strip()})"
+        if args.tflops is not None:
+            raise ValueError(
+                "--wall-clock already sets the hours; drop --tflops")
+    else:
+        tflops, tflops_label = _resolve_tflops(args)
+        if not dataset_tokens:
+            raise ValueError(
+                "cost needs a wall-clock: pass --wall-clock HOURS, or give "
+                "a dataset (--dataset-tokens or --examples + --avg-len) "
+                "so the throughput estimator can derive one")
+        est = T.estimate_throughput(
+            cfg, tflops, mfu=args.mfu, gpus=gpus,
+            scaling_eff=args.scaling_eff,
+            dataset_tokens=dataset_tokens, epochs=args.epochs)
+        hours = est.total_hours
+        source = (f"throughput estimate: {tflops_label} @ {tflops:g} "
+                  f"TFLOPS, MFU {args.mfu:.2f}")
+
+    cost_est = C.estimate_cost(
+        hours, args.gpu_rate, gpus=gpus,
+        total_tokens=total_tokens, wall_clock_source=source)
+    if args.format == "json":
+        print(R.render_cost_json(cost_est))
+    else:
+        print(R.render_cost(cost_est))
     return 0
 
 
@@ -350,6 +405,33 @@ def build_parser():
     pt.add_argument("--scaling-eff", type=float, default=0.90,
                     help="per-GPU efficiency when gpus > 1 (default: 0.90)")
     pt.set_defaults(func=cmd_throughput)
+
+    pk = sub.add_parser("cost",
+                        help="estimate the dollar cost of a training run")
+    _add_train_args(pk)
+    pk.add_argument("--gpu-rate", type=C.parse_gpu_rate, required=True,
+                    help="REQUIRED: your $/GPU-hour (e.g. 3.50). qcalc "
+                         "ships no price table; never guessed.")
+    pk.add_argument("--wall-clock", default=None,
+                    help="known run time in hours, decimal (3.5) or "
+                         "H:MM:SS (1:30:00). Skips the throughput estimator.")
+    pk.add_argument("--tflops", default=None,
+                    help="GPU peak BF16/FP16 tensor TFLOPS: a number like 165, "
+                         "or a known card name; overrides --gpu lookup")
+    pk.add_argument("--mfu", type=float, default=0.40,
+                    help="model FLOPs utilization 0-1 (default: 0.40)")
+    pk.add_argument("--dataset-tokens", type=float, default=None,
+                    help="training tokens per epoch (for wall-clock)")
+    pk.add_argument("--examples", type=float, default=None,
+                    help="dataset size in examples (needs --avg-len)")
+    pk.add_argument("--avg-len", type=float, default=None,
+                    help="average tokens per example (needs --examples)")
+    pk.add_argument("--epochs", type=int, default=1)
+    pk.add_argument("--gpus", type=int, default=1,
+                    help="number of GPUs (default: 1)")
+    pk.add_argument("--scaling-eff", type=float, default=0.90,
+                    help="per-GPU efficiency when gpus > 1 (default: 0.90)")
+    pk.set_defaults(func=cmd_cost)
 
     pm = sub.add_parser("models", help="list preset models and known GPUs")
     pm.set_defaults(func=cmd_models)

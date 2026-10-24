@@ -11,6 +11,7 @@ from qloracalc.estimator import (
     fits,
     suggest,
 )
+from qloracalc.cost import CostEstimate
 from qloracalc.throughput import ThroughputEstimate, format_duration
 
 GIB = 1024 ** 3
@@ -235,6 +236,47 @@ def render_throughput_json(est: ThroughputEstimate) -> str:
         "total_steps": est.total_steps,
         "total_seconds": est.total_seconds,
         "total_hours": est.total_hours,
+    }
+    return json.dumps(payload, indent=2)
+
+
+def render_cost(est: CostEstimate) -> str:
+    lines = [
+        "run cost estimate",
+        f"  wall-clock:     {format_duration(est.wall_clock_hours * 3600)} "
+        f"({est.wall_clock_hours:.2f} h) - {est.wall_clock_source}",
+        f"  per-GPU rate:   ${est.gpu_rate:.2f}/GPU-hour (you supplied it)",
+        f"  GPUs:           {est.gpus}",
+        "",
+        f"  total cost:     ${est.total_cost:,.2f}",
+    ]
+    per_m = est.cost_per_million_tokens
+    if per_m is not None:
+        lines.append(
+            f"  $/M tokens:     ${per_m:.2f} "
+            f"(over {est.total_tokens:,.0f} training tokens)")
+    lines += [
+        "",
+        "  qcalc ships no price table: cloud rates move too fast and vary "
+        "by",
+        "  region, commitment and spot vs on-demand. Re-run with your own "
+        "--gpu-rate",
+        "  to compare on-demand vs spot vs reserved quotes.",
+    ]
+    return "\n".join(lines)
+
+
+def render_cost_json(est: CostEstimate) -> str:
+    per_m = est.cost_per_million_tokens
+    payload = {
+        "wall_clock_hours": round(est.wall_clock_hours, 4),
+        "wall_clock_source": est.wall_clock_source,
+        "gpu_rate_per_hour": est.gpu_rate,
+        "gpus": est.gpus,
+        "total_cost": round(est.total_cost, 2),
+        "total_tokens": est.total_tokens,
+        "cost_per_million_tokens": (round(per_m, 2) if per_m is not None
+                                    else None),
     }
     return json.dumps(payload, indent=2)
 

@@ -98,6 +98,11 @@ qcalc throughput --model llama-3-8b --gpu rtx4090 --dataset-tokens 10000000 --ep
 qcalc throughput --model llama-3-8b --tflops 165 --examples 5000 --avg-len 2000 --gpus 2
 # rates only (no wall-clock) with an explicit MFU
 qcalc throughput --model llama-3-8b --tflops 312 --mfu 0.5
+
+# dollar cost of the run: wall-clock from the throughput inputs above
+qcalc cost --model llama-3-8b --tflops 165 --dataset-tokens 10000000 --epochs 3 --gpu-rate 3.50
+# same, but you already know the run takes 90 minutes on 2 GPUs
+qcalc cost --model llama-3-8b --wall-clock 1:30:00 --gpus 2 --gpu-rate 2.49
 ```
 
 ## How the math works
@@ -158,6 +163,35 @@ overrides the `--gpu` lookup; `--mfu` tunes the utilization assumption;
 with a +/-2x band: data loading, eval, checkpointing and optimizer
 overhead are not modelled.
 
+## Run cost
+
+`qcalc cost` turns the wall-clock into dollars:
+`total = hours x $/GPU-hour x GPUs`.
+
+```bash
+$ qcalc cost --model llama-3-8b --tflops 165 --dataset-tokens 10000000 --epochs 3 --gpu-rate 3.50
+run cost estimate
+  wall-clock:     8h 06m (8.11 h) - throughput estimate: 165 TFLOPS @ 165 TFLOPS, MFU 0.40
+  per-GPU rate:   $3.50/GPU-hour (you supplied it)
+  GPUs:           1
+
+  total cost:     $28.39
+  $/M tokens:     $0.95 (over 30,000,000 training tokens)
+
+  qcalc ships no price table: cloud rates move too fast and vary by
+  region, commitment and spot vs on-demand. Re-run with your own --gpu-rate
+  to compare on-demand vs spot vs reserved quotes.
+```
+
+`--gpu-rate` is **required** and never guessed: cloud prices move too
+fast for a built-in table, so a missing, zero or negative rate is an
+error. The wall-clock hours come from the same throughput inputs as
+`qcalc throughput`, or from a direct `--wall-clock` override in decimal
+hours (`3.5`) or `H:MM:SS` (`1:30:00`) when you already know how long the
+run takes. When the training token count is known you also get a
+`$/M tokens` line for comparing the run against per-token API pricing.
+`--format json` gives the same numbers machine-readable.
+
 ## Caveats
 
 This is an **estimate**, not a measurement. Real runs vary with the
@@ -169,7 +203,7 @@ overstates dense-equivalent training memory.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q   # 68 tests
+python -m pytest tests/ -q   # 87 tests
 ```
 
 ## License
